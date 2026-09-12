@@ -3,137 +3,276 @@ from __future__ import annotations
 import html
 import logging
 import os
-import tempfile
+from functools import wraps
 from pathlib import Path
 
+from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
 
-from scraper import MangaResult, ChapterResult, download_images_to_pdf, get_chapter_images, get_chapters, search_manga
+from scraper import ChapterResult, MangaResult, download_chapter_as_pdf, get_chapters, search_manga
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"]) if os.environ.get("ADMIN_USER_ID") else None
-SCRAPER_SOURCE = os.environ.get("SCRAPER_SOURCE", "azora")
+load_dotenv()
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID")
+
+if ADMIN_CHAT_ID_RAW:
+    try:
+        ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_RAW)
+    except ValueError as exc:
+        raise RuntimeError("ADMIN_CHAT_ID must be a numeric Telegram user/chat ID") from exc
+else:
+    ADMIN_CHAT_ID = None
+
+MAX_RESULTS = 10
+MAX_CHAPTERS = 30
+CALLBACK_TTL_TEXT = "انتهت صلاحية هذا الزر. أعد البحث عن المانجا."
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("telegram-manga-bot")
 
 
 def is_admin(update: Update) -> bool:
-    return ADMIN_USER_ID is None or bool(update.effective_user and update.effective_user.id == ADMIN_USER_ID)
+    user = update.effective_user
+    return bool(user and ADMIN_CHAT_ID is not None and user.id == ADMIN_CHAT_ID)
 
 
-def result_text(item: MangaResult) -> str:
-    return f"📚 <b>{html.escape(item.title)}</b>\n\n{html.escape(item.url)}"
+async def admin_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global first-stage guard: reject every non-admin update immediately."""
+    if is_admin(update):
+        return
+    text = "عذراً، هذا البوت خاص بالمشرف فقط."
+    try:
+        if update.callback_query:
+            await update.callback_query.answer(text, show_alert=True)
+        elif update.effective_message:
+            await update.effective_message.reply_text(text)
+    finally:
+        raise ApplicationHandlerStop
 
 
+def result_keyboard(results: list[MangaResult]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{index}. {item.title[:45]}", callback_data=f"manga:{index}")]
+        for index, item in enumerate(results)
+    ])
+
+
+def chapter_keyboard(chapters: list[ChapterResult]) -> InlineKeyboardMarkup:
+    rows = []
+    for index, chapter in enumerate(chapters):
+        label = chapter.number
+        if chapter.title:
+            label += f" — {chapter.title[:30]}"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"chapter:{index}")])
+    rows.append([InlineKeyboardButton("🔎 بحث جديد", callback_data="new_search")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update):
+            await admin_guard(update, context)
+            return
+        return await func(update, context)
+    return wrapper
+
+
+@admin_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "📚 <b>Manga Bot</b>\n\nأرسل:\n<code>/search اسم المانجا</code>\n\nسيتم البحث مباشرة في موقع المانجا ثم عرض الفصول.\nالمصدر الحالي: "
-        + html.escape(SCRAPER_SOURCE),
-        parse_mode=ParseMode.HTML,
+    await update.effective_message.reply_text(
+        "📚 أهلاً بك في Manga Bot الخاص بك.\n\n"
+        "أرسل اسم المانجا/المانهوا مباشرة، أو استخدم:\n"
+        "/search اسم المانجا\n\n"
+        "سأبحث في MangaDex وAzora وMangaSwat، ثم أعرض الفصول المتاحة "
+        "وأحوّل الفصل المختار إلى PDF مؤقتاً وأرسله لك."
     )
 
 
+@admin_only
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("⛔ هذا الأمر متاح للأدمن فقط.")
+    await perform_search(update, context, " ".join(context.args).strip())
+
+
+@admin_only
+async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message and update.effective_message.text:
+        await perform_search(update, context, update.effective_message.text.strip())
+
+
+async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+    message = update.effective_message
+    if not message:
         return
-    query = " ".join(context.args).strip()
     if not query:
-        await update.message.reply_text("استخدم: /search اسم المانجا")
+        await message.reply_text("اكتب اسم المانجا بعد /search أو أرسل الاسم مباشرة.")
         return
-    status = await update.message.reply_text("🔎 جاري البحث في الموقع...")
+
+    status = await message.reply_text("🔎 جاري البحث في المصادر...")
     try:
-        results = await search_manga(query, SCRAPER_SOURCE)
-        if not results:
-            await status.edit_text("لم أجد نتائج. جرّب اسماً آخر.")
-            return
-        buttons = [[InlineKeyboardButton(item.title[:60], callback_data=f"manga:{i}")] for i, item in enumerate(results)]
-        context.user_data["search_results"] = {str(i): item.__dict__ for i, item in enumerate(results)}
-        await status.edit_text("اختر المانجا:", reply_markup=InlineKeyboardMarkup(buttons))
+        results = await search_manga(query, limit=MAX_RESULTS)
     except Exception:
-        logger.exception("Scraper search failed")
-        await status.edit_text("تعذر الوصول للموقع حالياً. تأكد من أن الموقع متاح.")
+        logger.exception("Search failed for %r", query)
+        await status.edit_text("❌ حدث خطأ أثناء البحث. جرّب اسماً آخر.")
+        return
+
+    if not results:
+        await status.edit_text("لم أجد نتائج. جرّب الاسم الإنجليزي أو العربي للمانجا.")
+        return
+
+    context.user_data["search_results"] = results
+    await status.edit_text(
+        f"📚 نتائج البحث عن: <b>{html.escape(query)}</b>\nاختر المانجا:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=result_keyboard(results),
+    )
 
 
+@admin_only
 async def manga_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if not is_admin(update):
-        await query.edit_message_text("⛔ هذا الأمر متاح للأدمن فقط.")
-        return
-    item = context.user_data.get("search_results", {}).get(query.data.split(":", 1)[1])
-    if not item:
-        await query.edit_message_text("انتهت صلاحية النتيجة. أعد البحث.")
-        return
-    await query.edit_message_text("📚 جاري سحب الفصول من الموقع...")
     try:
-        chapters = await get_chapters(item["url"], SCRAPER_SOURCE)
-        if not chapters:
-            await query.edit_message_text("لم أجد فصولاً في صفحة المانجا.")
-            return
-        context.user_data["chapters"] = {str(i): chapter.__dict__ for i, chapter in enumerate(chapters[:30])}
-        buttons = [[InlineKeyboardButton(f"الفصل {c.number}" + (f" — {c.title[:25]}" if c.title else ""), callback_data=f"chapter:{i}")] for i, c in enumerate(chapters[:30])]
-        await query.edit_message_text(f"<b>{html.escape(item['title'])}</b>\n\nاختر الفصل:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        index = int(query.data.split(":", 1)[1])
+        item: MangaResult = context.user_data["search_results"][index]
+    except (KeyError, IndexError, ValueError, TypeError):
+        await query.edit_message_text(CALLBACK_TTL_TEXT)
+        return
+
+    await query.edit_message_text("📖 جاري جلب الفصول...")
+    try:
+        chapters = await get_chapters(item.url, source=item.source)
     except Exception:
-        logger.exception("Chapter listing failed")
-        await query.edit_message_text("تعذر سحب الفصول من الموقع حالياً.")
+        logger.exception("Chapter listing failed for %s", item.url)
+        await query.edit_message_text("❌ تعذر جلب الفصول من المصدر حالياً.")
+        return
+
+    if not chapters:
+        await query.edit_message_text(
+            f"❌ لم أجد فصولاً متاحة لـ <b>{html.escape(item.title)}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    chapters = chapters[:MAX_CHAPTERS]
+    context.user_data["selected_manga"] = item
+    context.user_data["chapters"] = chapters
+    await query.edit_message_text(
+        f"📚 <b>{html.escape(item.title)}</b>\n"
+        f"المصدر: {html.escape(item.source)}\n\nاختر الفصل:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=chapter_keyboard(chapters),
+    )
 
 
+@admin_only
 async def chapter_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if not is_admin(update):
-        await query.edit_message_text("⛔ هذا الأمر متاح للأدمن فقط.")
-        return
-    item = context.user_data.get("chapters", {}).get(query.data.split(":", 1)[1])
-    if not item:
-        await query.edit_message_text("انتهت صلاحية الفصل. أعد البحث.")
-        return
-    await query.edit_message_text("⏳ جاري سحب الفصل وتحميل الصور من الموقع...", parse_mode=ParseMode.HTML)
-    temp_path = None
     try:
-        image_urls = await get_chapter_images(item["url"], SCRAPER_SOURCE)
-        if not image_urls:
-            raise RuntimeError("No images")
-        with tempfile.NamedTemporaryFile(prefix="manga_", suffix=".pdf", delete=False) as tmp:
-            temp_path = Path(tmp.name)
-        count = await download_images_to_pdf(image_urls, str(temp_path))
-        if temp_path.stat().st_size > 49 * 1024 * 1024:
-            raise RuntimeError("PDF too large for Telegram")
-        await query.message.reply_document(
-            document=str(temp_path),
-            caption=f"📖 الفصل {html.escape(item['number'])}\nعدد الصفحات: {count}",
-            parse_mode=ParseMode.HTML,
+        index = int(query.data.split(":", 1)[1])
+        chapter: ChapterResult = context.user_data["chapters"][index]
+        manga: MangaResult = context.user_data["selected_manga"]
+    except (KeyError, IndexError, ValueError, TypeError):
+        await query.edit_message_text(CALLBACK_TTL_TEXT)
+        return
+
+    await query.edit_message_text(
+        "⏳ جاري سحب الصور وتحويل الفصل إلى PDF...\n"
+        "قد تستغرق العملية وقتاً حسب عدد الصفحات وحجم الصور."
+    )
+
+    pdf_path: str | None = None
+    try:
+        pdf_path, image_count = await download_chapter_as_pdf(chapter.url, source=chapter.source)
+        pdf_size = Path(pdf_path).stat().st_size
+        max_bytes = int(os.getenv("MAX_PDF_BYTES", str(49 * 1024 * 1024)))
+        if pdf_size > max_bytes:
+            raise RuntimeError("الـPDF الناتج أكبر من الحد الآمن للإرسال عبر Telegram.")
+
+        caption = (
+            f"📖 {manga.title}\n"
+            f"الفصل: {chapter.number}"
+            + (f" — {chapter.title}" if chapter.title else "")
+            + f"\n🖼️ الصفحات: {image_count}"
         )
-        await query.edit_message_text("✅ تم سحب الفصل وإرساله كملف PDF.")
-    except Exception:
-        logger.exception("Chapter PDF failed")
-        await query.edit_message_text("❌ تعذر إنشاء PDF للفصل. قد تكون صور الموقع محمية أو غير متاحة حالياً.")
+        with open(pdf_path, "rb") as document:
+            await query.message.reply_document(
+                document=document,
+                filename=f"{safe_filename(manga.title)} - {chapter.number}.pdf",
+                caption=caption[:1024],
+            )
+        await query.message.reply_text("✅ تم إرسال الفصل. تم تنظيف الملفات المؤقتة.")
+    except Exception as exc:
+        logger.exception("Chapter PDF failed for %s", chapter.url)
+        await query.message.reply_text(f"❌ تعذر تجهيز الفصل: {exc}")
     finally:
-        if temp_path:
+        if pdf_path:
             try:
-                temp_path.unlink(missing_ok=True)
+                Path(pdf_path).unlink(missing_ok=True)
             except OSError:
-                pass
+                logger.warning("Could not remove PDF %s", pdf_path)
+
+
+@admin_only
+async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("search_results", None)
+    context.user_data.pop("selected_manga", None)
+    context.user_data.pop("chapters", None)
+    await query.message.reply_text("🔎 أرسل اسم المانجا التي تريد البحث عنها.")
+
+
+def safe_filename(value: str) -> str:
+    cleaned = "".join(c for c in value if c.isalnum() or c in " _-").strip()
+    return (cleaned or "manga")[:80]
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception", exc_info=context.error)
+    if isinstance(context.error, TelegramError):
+        logger.error("Telegram error: %s", context.error)
+
+
+def build_application() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is required")
+    if ADMIN_CHAT_ID is None:
+        raise RuntimeError("ADMIN_CHAT_ID environment variable is required")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(TypeHandler(Update, admin_guard), group=-1)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CallbackQueryHandler(manga_selected, pattern=r"^manga:\d+$"))
+    application.add_handler(CallbackQueryHandler(chapter_selected, pattern=r"^chapter:\d+$"))
+    application.add_handler(CallbackQueryHandler(new_search, pattern=r"^new_search$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
+    application.add_error_handler(error_handler)
+    return application
 
 
 def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is required")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("search", search_command))
-    app.add_handler(CallbackQueryHandler(manga_selected, pattern=r"^manga:"))
-    app.add_handler(CallbackQueryHandler(chapter_selected, pattern=r"^chapter:"))
-    app.add_error_handler(error_handler)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    application = build_application()
+    logger.info("Bot starting")
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

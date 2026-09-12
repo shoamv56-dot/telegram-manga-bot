@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: telegram-manga-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: AZORA_BASE_URL
+        value: https://azorafly.com
+      - key: MANGASWAT_BASE_URL
+        value: https://mangaswat.com

@@ -5,4 +5,8 @@ __pycache__/
 .venv/
 venv/
 *.log
-manga_cache.sqlite3
+*.sqlite3
+data/
+tmp/
+temp/
+.manga_tmp/
