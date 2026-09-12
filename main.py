@@ -1,208 +1,137 @@
+from __future__ import annotations
+
 import html
 import logging
 import os
-import sqlite3
-from contextlib import closing
-from typing import Any
+import tempfile
+from pathlib import Path
 
-import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, InlineQueryHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+
+from scraper import MangaResult, ChapterResult, download_images_to_pdf, get_chapter_images, get_chapters, search_manga
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MANGADEX_API = "https://api.mangadex.org"
-MANGADEX_COVER = "https://uploads.mangadex.org/covers"
-PAGE_SIZE = 10
-DB_PATH = os.environ.get("CACHE_DB_PATH", "manga_cache.sqlite3")
+ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"]) if os.environ.get("ADMIN_USER_ID") else None
+SCRAPER_SOURCE = os.environ.get("SCRAPER_SOURCE", "azora")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-http_client: httpx.AsyncClient | None = None
 
 
-def db_init() -> None:
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute("CREATE TABLE IF NOT EXISTS image_cache (chapter_id TEXT PRIMARY KEY, file_ids TEXT NOT NULL)")
-        db.commit()
+def is_admin(update: Update) -> bool:
+    return ADMIN_USER_ID is None or bool(update.effective_user and update.effective_user.id == ADMIN_USER_ID)
 
 
-def cache_get(chapter_id: str) -> list[str] | None:
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        row = db.execute("SELECT file_ids FROM image_cache WHERE chapter_id = ?", (chapter_id,)).fetchone()
-    if not row:
-        return None
-    return row[0].split("\n") if row[0] else []
-
-
-def cache_put(chapter_id: str, file_ids: list[str]) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute("INSERT OR REPLACE INTO image_cache (chapter_id, file_ids) VALUES (?, ?)", (chapter_id, "\n".join(file_ids)))
-        db.commit()
-
-
-def title_of(manga: dict[str, Any]) -> str:
-    titles = manga.get("attributes", {}).get("title", {})
-    return next(iter(titles.values()), "Untitled manga")
-
-
-def description_of(manga: dict[str, Any]) -> str:
-    descriptions = manga.get("attributes", {}).get("description", {})
-    return next(iter(descriptions.values()), "No description available.").replace("\n", " ")[:700]
-
-
-def cover_url(manga: dict[str, Any]) -> str | None:
-    for relation in manga.get("relationships", []):
-        if relation.get("type") == "cover_art":
-            filename = relation.get("attributes", {}).get("fileName")
-            if filename:
-                return f"{MANGADEX_COVER}/{manga['id']}/{filename}.256.jpg"
-    return None
-
-
-async def api_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    if http_client is None:
-        raise RuntimeError("HTTP client is not initialized")
-    response = await http_client.get(MANGADEX_API + path, params=params)
-    response.raise_for_status()
-    return response.json()
-
-
-async def search_manga(query: str) -> list[dict[str, Any]]:
-    data = await api_get("/manga", {"title": query, "limit": 10, "includes[]": "cover_art", "contentRating[]": ["safe", "suggestive"]})
-    return data.get("data", [])
-
-
-async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = (update.inline_query.query or "").strip()
-    if not query:
-        return
-    try:
-        results = []
-        for manga in await search_manga(query):
-            title = title_of(manga)
-            desc = description_of(manga)
-            results.append(
-                InlineQueryResultArticle(
-                    id=manga["id"],
-                    title=title[:64],
-                    description=desc[:200],
-                    thumbnail_url=cover_url(manga),
-                    input_message_content=InputTextMessageContent(f"<b>{html.escape(title)}</b>\n\n{html.escape(desc)}", parse_mode=ParseMode.HTML),
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📚 الفصول", callback_data=f"manga:{manga['id']}")]]),
-                )
-            )
-        await update.inline_query.answer(results, cache_time=30, is_personal=True)
-    except Exception:
-        logger.exception("Inline search failed")
-        await update.inline_query.answer([], cache_time=5)
+def result_text(item: MangaResult) -> str:
+    return f"📚 <b>{html.escape(item.title)}</b>\n\n{html.escape(item.url)}"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📚 <b>Manga Bot</b>\n\nابحث عن المانجا عبر الوضع Inline:\n<code>@اسم_البوت naruto</code>\n\nثم اختر المانجا واضغط «📚 الفصول».",
+        "📚 <b>Manga Bot</b>\n\nأرسل:\n<code>/search اسم المانجا</code>\n\nسيتم البحث مباشرة في موقع المانجا ثم عرض الفصول.\nالمصدر الحالي: "
+        + html.escape(SCRAPER_SOURCE),
         parse_mode=ParseMode.HTML,
     )
 
 
-async def manga_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text("⛔ هذا الأمر متاح للأدمن فقط.")
+        return
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text("استخدم: /search اسم المانجا")
+        return
+    status = await update.message.reply_text("🔎 جاري البحث في الموقع...")
+    try:
+        results = await search_manga(query, SCRAPER_SOURCE)
+        if not results:
+            await status.edit_text("لم أجد نتائج. جرّب اسماً آخر.")
+            return
+        buttons = [[InlineKeyboardButton(item.title[:60], callback_data=f"manga:{i}")] for i, item in enumerate(results)]
+        context.user_data["search_results"] = {str(i): item.__dict__ for i, item in enumerate(results)}
+        await status.edit_text("اختر المانجا:", reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception:
+        logger.exception("Scraper search failed")
+        await status.edit_text("تعذر الوصول للموقع حالياً. تأكد من أن الموقع متاح.")
+
+
+async def manga_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    manga_id = query.data.split(":", 1)[1]
+    if not is_admin(update):
+        await query.edit_message_text("⛔ هذا الأمر متاح للأدمن فقط.")
+        return
+    item = context.user_data.get("search_results", {}).get(query.data.split(":", 1)[1])
+    if not item:
+        await query.edit_message_text("انتهت صلاحية النتيجة. أعد البحث.")
+        return
+    await query.edit_message_text("📚 جاري سحب الفصول من الموقع...")
     try:
-        manga = (await api_get(f"/manga/{manga_id}", {"includes[]": "cover_art"})).get("data", {})
-        await show_chapters(query, manga_id, title_of(manga), description_of(manga))
-    except Exception:
-        logger.exception("Manga details failed")
-        await query.edit_message_text("تعذر جلب بيانات المانجا حاليًا.")
-
-
-async def show_chapters(query, manga_id: str, title: str, desc: str) -> None:
-    data = await api_get("/chapter", {
-        "manga[]": manga_id,
-        "limit": PAGE_SIZE,
-        "order[chapter]": "desc",
-        "translatedLanguage[]": ["ar", "en"],
-        "contentRating[]": ["safe", "suggestive"],
-        "includes[]": "scanlation_group",
-    })
-    buttons = []
-    for chapter in data.get("data", []):
-        attrs = chapter.get("attributes", {})
-        number = attrs.get("chapter") or "?"
-        name = attrs.get("title") or ""
-        label = f"الفصل {number}" + (f" — {name[:28]}" if name else "")
-        buttons.append([InlineKeyboardButton(label[:64], callback_data=f"chapter:{chapter['id']}")])
-    buttons.append([InlineKeyboardButton("🔄 تحديث الفصول", callback_data=f"manga:{manga_id}")])
-    text = f"<b>{html.escape(title)}</b>\n\n{html.escape(desc)}\n\n<b>آخر الفصول:</b>"
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def read_chapter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer("جاري تجهيز الفصل…")
-    chapter_id = query.data.split(":", 1)[1]
-    try:
-        cached = cache_get(chapter_id)
-        if cached:
-            for start in range(0, len(cached), 10):
-                from telegram import InputMediaPhoto
-                await query.message.reply_media_group([InputMediaPhoto(file_id) for file_id in cached[start:start + 10]])
+        chapters = await get_chapters(item["url"], SCRAPER_SOURCE)
+        if not chapters:
+            await query.edit_message_text("لم أجد فصولاً في صفحة المانجا.")
             return
-
-        data = await api_get(f"/at-home/server/{chapter_id}")
-        chapter = data.get("chapter", {})
-        base_url = data.get("baseUrl")
-        chapter_hash = chapter.get("hash")
-        pages = chapter.get("data", [])
-        if not base_url or not chapter_hash or not pages:
-            raise RuntimeError("No chapter pages")
-
-        from telegram import InputMediaPhoto
-        file_ids: list[str] = []
-        for start in range(0, len(pages), 10):
-            media = [InputMediaPhoto(f"{base_url}/data/{chapter_hash}/{page}") for page in pages[start:start + 10]]
-            messages = await query.message.reply_media_group(media)
-            file_ids.extend([m.photo[-1].file_id for m in messages if m.photo])
-        if file_ids:
-            cache_put(chapter_id, file_ids)
-        await query.message.reply_text("✅ تم إرسال الفصل. في المرة القادمة سيُستخدم التخزين المؤقت لتسريع الإرسال.")
+        context.user_data["chapters"] = {str(i): chapter.__dict__ for i, chapter in enumerate(chapters[:30])}
+        buttons = [[InlineKeyboardButton(f"الفصل {c.number}" + (f" — {c.title[:25]}" if c.title else ""), callback_data=f"chapter:{i}")] for i, c in enumerate(chapters[:30])]
+        await query.edit_message_text(f"<b>{html.escape(item['title'])}</b>\n\nاختر الفصل:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
-        logger.exception("Chapter read failed")
-        await query.message.reply_text("تعذر تحميل صفحات الفصل حاليًا. حاول مرة أخرى لاحقًا.")
+        logger.exception("Chapter listing failed")
+        await query.edit_message_text("تعذر سحب الفصول من الموقع حالياً.")
+
+
+async def chapter_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("⛔ هذا الأمر متاح للأدمن فقط.")
+        return
+    item = context.user_data.get("chapters", {}).get(query.data.split(":", 1)[1])
+    if not item:
+        await query.edit_message_text("انتهت صلاحية الفصل. أعد البحث.")
+        return
+    await query.edit_message_text("⏳ جاري سحب الفصل وتحميل الصور من الموقع...", parse_mode=ParseMode.HTML)
+    temp_path = None
+    try:
+        image_urls = await get_chapter_images(item["url"], SCRAPER_SOURCE)
+        if not image_urls:
+            raise RuntimeError("No images")
+        with tempfile.NamedTemporaryFile(prefix="manga_", suffix=".pdf", delete=False) as tmp:
+            temp_path = Path(tmp.name)
+        count = await download_images_to_pdf(image_urls, str(temp_path))
+        if temp_path.stat().st_size > 49 * 1024 * 1024:
+            raise RuntimeError("PDF too large for Telegram")
+        await query.message.reply_document(
+            document=str(temp_path),
+            caption=f"📖 الفصل {html.escape(item['number'])}\nعدد الصفحات: {count}",
+            parse_mode=ParseMode.HTML,
+        )
+        await query.edit_message_text("✅ تم سحب الفصل وإرساله كملف PDF.")
+    except Exception:
+        logger.exception("Chapter PDF failed")
+        await query.edit_message_text("❌ تعذر إنشاء PDF للفصل. قد تكون صور الموقع محمية أو غير متاحة حالياً.")
+    finally:
+        if temp_path:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception", exc_info=context.error)
 
 
-async def post_init(app: Application) -> None:
-    global http_client
-    db_init()
-    http_client = httpx.AsyncClient(timeout=30, headers={"User-Agent": "MangaBot/1.1"})
-
-
-async def post_shutdown(app: Application) -> None:
-    global http_client
-    if http_client:
-        await http_client.aclose()
-        http_client = None
-
-
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is required")
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(InlineQueryHandler(inline_query))
-    app.add_handler(CallbackQueryHandler(manga_details, pattern=r"^manga:"))
-    app.add_handler(CallbackQueryHandler(read_chapter, pattern=r"^chapter:"))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CallbackQueryHandler(manga_selected, pattern=r"^manga:"))
+    app.add_handler(CallbackQueryHandler(chapter_selected, pattern=r"^chapter:"))
     app.add_error_handler(error_handler)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -1,40 +1,49 @@
 # Telegram Manga Bot
 
-بوت Telegram للبحث عن المانجا عبر MangaDex وقراءة الفصول.
+بوت تليجرام شخصي للبحث في مواقع المانجا العربية وسحب الفصول مباشرة من الموقع ثم تحويل صفحات الفصل إلى PDF وإرساله للمستخدم.
 
-## المميزات
-- Inline Search مثل `@اسم_البوت naruto`.
-- عرض تفاصيل المانجا وآخر 10 فصول مترجمة بالعربية أو الإنجليزية.
-- تحميل صفحات الفصل وإرسالها كـ Telegram media groups.
-- تخزين دائم لـ Telegram `file_id` باستخدام SQLite، بحيث يبقى الكاش بعد إعادة تشغيل البوت.
-- `BOT_TOKEN` محفوظ في متغير بيئة وليس داخل الكود.
-- جاهز للتشغيل عبر Docker.
+## المزايا
+- `/search اسم المانجا` للبحث المباشر في الموقع.
+- عرض نتائج البحث كأزرار.
+- سحب قائمة الفصول من صفحة المانجا.
+- تنزيل صور الفصل مباشرة من صفحة القراءة.
+- تحويل الصور إلى PDF مؤقتاً ثم إرسال الملف وحذفه بعد الإرسال.
+- `httpx + BeautifulSoup4` مع User-Agent وTimeout وRetry.
+- مصدر Azora مفعّل افتراضياً، ويمكن تبديله إلى MangaSwat.
 
-## التشغيل محليًا
+## إعداد البيئة
 
+### المتغيرات
+- `BOT_TOKEN`: توكن BotFather.
+- `ADMIN_USER_ID`: اختياري، رقم Telegram ID للأدمن. إذا لم تضفه يصبح `/search` متاحاً للجميع.
+- `SCRAPER_SOURCE`: `azora` افتراضياً أو `mangaswat`.
+
+### تشغيل محلي
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 export BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
+export ADMIN_USER_ID="YOUR_TELEGRAM_USER_ID"
 python main.py
 ```
 
-على Windows PowerShell:
-
+PowerShell:
 ```powershell
 $env:BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
+$env:ADMIN_USER_ID="YOUR_TELEGRAM_USER_ID"
 python main.py
 ```
 
-## Docker
-
+### Docker
 ```bash
 docker build -t telegram-manga-bot .
-docker run -d --name manga-bot -e BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN" -v manga-data:/app/data telegram-manga-bot
+docker run -d --name manga-bot -e BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN" -e ADMIN_USER_ID="YOUR_TELEGRAM_USER_ID" telegram-manga-bot
 ```
 
-إذا أردت حفظ قاعدة الكاش في مجلد مخصص، عيّن `CACHE_DB_PATH`، مثل `/app/data/manga_cache.sqlite3`.
-
-## ملاحظة
-استخدام MangaDex وحقوق نشر الفصول يخضع لسياسات MangaDex والقوانين المحلية. البوت هنا يعرض المحتوى المتاح عبر MangaDex ولا يتجاوز أنظمة الوصول أو الحماية.
+## ملاحظات عن المواقع
+- `scraper.py` يعتمد على HTML الفعلي للموقع، لذلك قد تحتاج CSS selectors إلى تحديث إذا غيّر الموقع تصميمه.
+- نطاق Azora الحالي مضبوط على `https://azorafly.com`.
+- نطاق MangaSwat مضبوط على `https://mangaswat.com`.
+- لا يستخدم المشروع أدوات لتجاوز Cloudflare أو CAPTCHA. إذا كان الموقع يمنع الطلبات الآلية، يجب احترام الحماية أو استخدام API/وسيلة وصول يسمح بها الموقع.
+- لا تضع `BOT_TOKEN` داخل GitHub أو داخل الكود.
