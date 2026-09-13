@@ -250,12 +250,23 @@ async def chapter_to_files(chapter: ChapterResult, temp_dir: str) -> list[str]:
     return paths
 
 
-async def download_chapter_as_pdf(chapter_url: str, source: str | None = None) -> tuple[str,int]:
-    source=source or source_from_url(chapter_url); temp=tempfile.mkdtemp(prefix="manga_"); out=None
+async def write_cbz(paths: list[str], output: str) -> None:
+    import zipfile
+    def _write():
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            for index, path in enumerate(paths, 1):
+                z.write(path, f"{index:05d}.jpg")
+    await asyncio.to_thread(_write)
+
+
+async def download_chapter_as_pdf(chapter_url: str, source: str | None = None) -> tuple[str, int]:
+    source = source or source_from_url(chapter_url)
+    temp = tempfile.mkdtemp(prefix="manga_"); out = None
     try:
-        paths=await chapter_to_files(ChapterResult("?","",chapter_url,source),temp)
-        with tempfile.NamedTemporaryFile(prefix="manga_",suffix=".pdf",delete=False) as f: out=f.name
-        await asyncio.to_thread(write_pdf,paths,out); return out,len(paths)
+        paths = await chapter_to_files(ChapterResult("?", "", chapter_url, source), temp)
+        with tempfile.NamedTemporaryFile(prefix="manga_", suffix=".pdf", delete=False) as f: out = f.name
+        await asyncio.to_thread(write_pdf, paths, out)
+        return out, len(paths)
     except Exception:
         if out: Path(out).unlink(missing_ok=True)
         raise
@@ -264,7 +275,23 @@ async def download_chapter_as_pdf(chapter_url: str, source: str | None = None) -
         Path(temp).rmdir()
 
 
-async def download_chapters_as_pdf(chapters: list[ChapterResult], progress: Callable[[int,int],Awaitable[None]]|None=None) -> tuple[str,int,int]:
+async def download_chapter_as_cbz(chapter_url: str, source: str | None = None) -> tuple[str, int]:
+    source = source or source_from_url(chapter_url)
+    temp = tempfile.mkdtemp(prefix="manga_cbz_"); out = None
+    try:
+        paths = await chapter_to_files(ChapterResult("?", "", chapter_url, source), temp)
+        with tempfile.NamedTemporaryFile(prefix="manga_", suffix=".cbz", delete=False) as f: out = f.name
+        await write_cbz(paths, out)
+        return out, len(paths)
+    except Exception:
+        if out: Path(out).unlink(missing_ok=True)
+        raise
+    finally:
+        for p in Path(temp).glob("*.jpg"): p.unlink(missing_ok=True)
+        Path(temp).rmdir()
+
+
+async def download_chapters_as_pdf(chapters: list[ChapterResult], progress: Callable[[int,int],Awaitable[None]] | None = None) -> tuple[str,int,int]:
     if not chapters: raise RuntimeError("لم يتم تحديد فصول للتنزيل.")
     temp=tempfile.mkdtemp(prefix="manga_batch_"); out=None; all_paths=[]; pages=0
     try:
@@ -272,10 +299,46 @@ async def download_chapters_as_pdf(chapters: list[ChapterResult], progress: Call
             paths=await chapter_to_files(ch,temp); all_paths.extend(paths); pages+=len(paths)
             if progress: await progress(done,len(chapters))
         with tempfile.NamedTemporaryFile(prefix="manga_batch_",suffix=".pdf",delete=False) as f: out=f.name
-        await asyncio.to_thread(write_pdf,all_paths,out); return out,len(chapters),pages
+        await asyncio.to_thread(write_pdf,all_paths,out)
+        return out,len(chapters),pages
     except Exception:
         if out: Path(out).unlink(missing_ok=True)
         raise
     finally:
         for p in Path(temp).glob("*.jpg"): p.unlink(missing_ok=True)
         Path(temp).rmdir()
+
+
+async def download_chapters_as_cbz(chapters: list[ChapterResult], progress: Callable[[int,int],Awaitable[None]] | None = None) -> tuple[str,int,int]:
+    if not chapters: raise RuntimeError("لم يتم تحديد فصول للتنزيل.")
+    temp=tempfile.mkdtemp(prefix="manga_batch_cbz_"); out=None; all_paths=[]; pages=0
+    try:
+        for done,ch in enumerate(chapters,1):
+            chapter_dir=Path(temp)/f"chapter_{done:04d}"; chapter_dir.mkdir()
+            paths=await chapter_to_files(ch,str(chapter_dir)); all_paths.extend(paths); pages+=len(paths)
+            # Preserve chapter boundaries and ordering in the CBZ archive.
+            for i,path in enumerate(paths,1): Path(path).rename(chapter_dir/f"{done:04d}-{i:05d}.jpg")
+            all_paths=[str(x) for x in Path(temp).glob("chapter_*/*.jpg")]
+            all_paths.sort()
+            if progress: await progress(done,len(chapters))
+        with tempfile.NamedTemporaryFile(prefix="manga_batch_",suffix=".cbz",delete=False) as f: out=f.name
+        await write_cbz(all_paths,out)
+        return out,len(chapters),pages
+    except Exception:
+        if out: Path(out).unlink(missing_ok=True)
+        raise
+    finally:
+        import shutil
+        shutil.rmtree(temp,ignore_errors=True)
+
+
+async def download_chapter_as_file(chapter: ChapterResult, fmt: str = "pdf") -> tuple[str,int]:
+    fmt=fmt.lower()
+    if fmt=="cbz": return await download_chapter_as_cbz(chapter.url,chapter.source)
+    return await download_chapter_as_pdf(chapter.url,chapter.source)
+
+
+async def download_chapters_as_file(chapters: list[ChapterResult], fmt: str = "pdf", progress: Callable[[int,int],Awaitable[None]] | None = None) -> tuple[str,int,int]:
+    fmt=fmt.lower()
+    if fmt=="cbz": return await download_chapters_as_cbz(chapters,progress=progress)
+    return await download_chapters_as_pdf(chapters,progress=progress)
