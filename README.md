@@ -1,105 +1,84 @@
 # Telegram Manga Bot
 
-بوت Telegram شخصي (Admin-Only) للبحث عن المانجا والمانهوا وتصفح الفصول وتحويل الفصل المختار إلى PDF وإرساله مباشرة إلى حساب المشرف.
+بوت Telegram خاص بالمشرف للبحث عن المانجا وسحب الفصول وتحويلها إلى PDF مضغوط بجودة متوسطة.
 
 ## المزايا
 
-- حماية شاملة: لا يستجيب إلا لمعرف `ADMIN_CHAT_ID`.
-- البحث من MangaDex API وAzora وMangaSwat.
-- أزرار تفاعلية لاختيار المانجا والفصل.
-- تنزيل صور الفصل بالترتيب وتحويلها إلى PDF واحد.
-- حذف ملف PDF المؤقت بعد إرساله.
-- مهلات وإعادة محاولات للطلبات.
-- دعم `curl_cffi` مع محاكاة متصفح Chrome لتحسين توافق HTTP مع المواقع الحديثة.
-- لا يحاول حل CAPTCHA أو تجاوز أنظمة الوصول التي تمنع الأتمتة؛ إذا رفض الموقع الطلب يفشل المصدر مع بقاء بقية المصادر متاحة.
+- 🔒 وصول المشرف فقط عبر `ADMIN_CHAT_ID`.
+- 🔎 اختيار مصدر البحث من أزرار داخل Telegram:
+  - 🔵 سوات
+  - 🔷 ازورا
+  - 🟣 تيم اكس
+  - 🟢 مانجاليك
+  - 🌐 البحث في جميع المصادر
+- 📚 عرض مصدر كل نتيجة.
+- 📄 تنزيل فصل منفرد كـ PDF.
+- 📦 تنزيل حزم مثل `1-30` و`31-60` و`61-90` في PDF واحد.
+- 🗜️ ضغط الصور تلقائيًا بجودة متوسطة لتقليل حجم الـPDF.
+- 🧹 حذف الملفات المؤقتة بعد إرسالها.
+- 🐳 يعمل محليًا أو عبر Docker.
 
-## التشغيل محلياً
+## التشغيل محليًا
 
 ```bash
+git clone https://github.com/shoamv56-dot/telegram-manga-bot.git
+cd telegram-manga-bot
 python -m venv .venv
+# Linux/macOS
 source .venv/bin/activate
+# Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# عدّل .env وضع BOT_TOKEN و ADMIN_CHAT_ID
 python main.py
 ```
 
-في Windows PowerShell استخدم `py -m venv .venv` ثم `.\\.venv\\Scripts\\Activate.ps1`.
+في Windows أنشئ `.env` يدويًا إذا لم يتوفر `cp`.
 
-`python-dotenv` يقرأ ملف `.env` تلقائياً عند التشغيل المحلي. في الاستضافة يمكنك استخدام Environment Variables مباشرة.
+## متغيرات البيئة
 
-## إعداد Telegram
+```env
+BOT_TOKEN=...
+ADMIN_CHAT_ID=...
+SWAT_BASE_URL=https://mangaswat.com
+AZORA_BASE_URL=https://azorafly.com
+TEAMX_BASE_URL=https://www.olympustaff.com
+MANGALIKE_BASE_URL=https://like-manga.net
+PDF_JPEG_QUALITY=65
+PDF_MAX_WIDTH=1600
+PDF_MAX_HEIGHT=2400
+MAX_PDF_BYTES=51380224
+```
 
-1. افتح `@BotFather`.
-2. استخدم `/newbot` وأنشئ البوت.
-3. انسخ `BOT_TOKEN`.
-4. احصل على معرف Telegram الرقمي لحسابك (`ADMIN_CHAT_ID`).
-5. لا ترسل التوكن إلى GitHub أو لأي شخص.
+لا تضع `BOT_TOKEN` في GitHub أو داخل الكود.
 
-## المتغيرات
+## طريقة الاستخدام
 
-| المتغير | مطلوب | الوصف |
-|---|---|---|
-| `BOT_TOKEN` | نعم | توكن البوت |
-| `ADMIN_CHAT_ID` | نعم | Telegram numeric user/chat ID المسموح له |
-| `AZORA_BASE_URL` | لا | نطاق Azora |
-| `MANGASWAT_BASE_URL` | لا | نطاق MangaSwat |
-| `SCRAPER_TIMEOUT` | لا | مهلة طلب HTTP بالثواني |
-| `SCRAPER_RETRIES` | لا | عدد المحاولات |
-| `MAX_CHAPTER_IMAGES` | لا | الحد الأقصى لصور الفصل |
-| `MAX_PDF_BYTES` | لا | الحد الأقصى لحجم PDF قبل إرساله |
-| `MANGADEX_IMAGE_QUALITY` | لا | `data` أو `data-saver` |
-| `LOG_LEVEL` | لا | مستوى السجل |
+1. أرسل `/start`.
+2. اختر المصدر: سوات، ازورا، تيم اكس، مانجاليك، أو الكل.
+3. أرسل اسم المانجا.
+4. اختر العمل من النتائج.
+5. ستظهر حزم الفصول تلقائيًا حسب الموجود، مثل:
+   - `📦 تنزيل 1 - 30`
+   - `📦 تنزيل 31 - 60`
+   - `📦 تنزيل 61 - 90`
+6. أو اختر فصلًا منفردًا.
+7. البوت يحول الصفحات إلى PDF مضغوط بجودة متوسطة ثم يرسله ويحذف الملف المؤقت.
 
-## GitHub Secrets
+## ملاحظات مهمة
 
-من **Repository → Settings → Secrets and variables → Actions → New repository secret** أضف:
-
-- `BOT_TOKEN`
-- `ADMIN_CHAT_ID`
-
-GitHub Secrets لا تجعل المتغيرات متاحة تلقائياً لخدمة استضافة خارج GitHub. عند استخدام Render/Railway/Koyeb، أضف نفس المتغيرات في إعدادات الخدمة نفسها.
+- حجم الحزمة يعتمد على عدد الصفحات وحجمها الأصلي. إذا تجاوز الـPDF الحد المحدد في `MAX_PDF_BYTES` سيطلب البوت استخدام حزمة أصغر.
+- جودة الضغط الافتراضية متوسطة: JPEG quality 65 مع حد أقصى 1600×2400 للصورة.
+- مواقع المانجا قد تغير HTML أو تمنع الطلبات الآلية. في هذه الحالة يحتاج الـscraper إلى تحديث selectors أو رابط المصدر.
+- `curl_cffi` يستخدم توافقًا شبيهًا بالمتصفح للطلبات؛ لا يستخدم لتجاوز CAPTCHA أو ضوابط الوصول.
+- مصادر Team X وMangaLike وAzora وSwat قابلة لتغيير النطاق من `.env` دون تعديل الكود.
 
 ## Docker
 
 ```bash
 docker build -t telegram-manga-bot .
-docker run -d --name telegram-manga-bot --restart unless-stopped \
-  -e BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN" \
-  -e ADMIN_CHAT_ID="YOUR_TELEGRAM_USER_ID" \
-  telegram-manga-bot
+docker run --env-file .env telegram-manga-bot
 ```
 
-## Render
+## Telegram Bot API
 
-المشروع يحتوي على `render.yaml` كإعداد أولي لـ Background Worker. اربط المستودع، أنشئ الخدمة، وأدخل `BOT_TOKEN` و`ADMIN_CHAT_ID` كـ Environment Variables ثم Deploy.
-
-## الاستخدام
-
-- `/start` — رسالة الترحيب.
-- `/search One Piece` — بحث مباشر.
-- أو أرسل اسم المانجا كنص عادي.
-- اختر المانجا ثم الفصل.
-- انتظر إنشاء PDF وسيُرسل الملف إلى المحادثة.
-
-## ملاحظات
-
-- الـPDF والبيانات المؤقتة لا يتم تخزينها بشكل دائم بواسطة البوت.
-- بعد إرسال الـPDF يحاول البوت حذف الملف المؤقت فوراً.
-- بعض المواقع تغيّر HTML أو تمنع الطلبات الآلية؛ عندها قد تحتاج محددات HTML محدثة في `scraper.py`.
-- `curl_cffi` هنا لتحسين توافق HTTP مع المواقع التي تتطلب بصمة متصفح حديثة، وليس لتجاوز CAPTCHA أو التحايل على صلاحيات الوصول.
-- احترم شروط استخدام المواقع وحقوق نشر المحتوى الذي تصل إليه.
-
-## هيكل المشروع
-
-```text
-telegram-manga-bot/
-├── main.py
-├── scraper.py
-├── requirements.txt
-├── .env.example
-├── .gitignore
-├── Dockerfile
-├── render.yaml
-└── README.md
-```
+البوت يستخدم long polling، لذلك لا يحتاج إلى فتح Port عام أو Webhook.
